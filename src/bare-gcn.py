@@ -5,6 +5,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 # ----- normalization (same as before) -----
 def normalize_adj_weighted(adj: torch.Tensor, self_loop_weight: float = 1.0,
@@ -61,7 +62,7 @@ class GCN(nn.Module):
 
 # ----- Graph-level classifier wrapper -----
 class GraphLevelGCN(nn.Module):
-    def __init__(self, in_dim: int = 128, hidden_dim: int = 64, node_out_dim: int = 64,
+    def __init__(self, in_dim: int = 128, hidden_dim: int = 32, node_out_dim: int = 64,
                  num_classes: int = 2, gcn_dropout: float = 0.5, gcn_input_dropout: float = 0.1,
                  use_batchnorm: bool = True, graph_dropout: float = 0.5):
         super().__init__()
@@ -224,7 +225,7 @@ if __name__ == "__main__":
         DATA_DIR = INPUT_DIR
 
     # -------- load your data --------
-    X_np = np.load(os.path.join(DATA_DIR, "subject_embedding_matrices.npy"))   # (S, N, 128)
+    X_np = np.load(os.path.join(DATA_DIR, "subject_embedding_matrices_nofinetune.npy"))   # (S, N, 128)
     A_np = np.load(os.path.join(DATA_DIR, "subject_adjacency_matrices.npy"))   # (S, N, N), values in [0,1]
     y_np = np.load(os.path.join(DATA_DIR, "labels.npy"))                       # (S,)
 
@@ -259,7 +260,7 @@ if __name__ == "__main__":
 
     num_classes = int(y_all.max().item() + 1)
     model = GraphLevelGCN(
-        in_dim=128, hidden_dim=64, node_out_dim=64, num_classes=num_classes,
+        in_dim=128, hidden_dim=32, node_out_dim=64, num_classes=num_classes,
         gcn_dropout=0.2, gcn_input_dropout=0.05, use_batchnorm=True, graph_dropout=0.2
     ).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -393,6 +394,23 @@ if __name__ == "__main__":
 
     EDGE_DROP_PROB = 0.10
 
+    # ----- early stopping and metric tracking -----
+    EARLY_STOP_PATIENCE = 10
+    best_test_acc = -1.0
+    best_epoch = -1
+    epochs_since_improve = 0
+    best_state = None
+    use_early_stop = test_idx.numel() > 0
+
+    history = {
+        "train_acc": [],
+        "val_acc": [],
+        "test_acc": [],
+        "train_loss": [],
+        "val_loss": [],
+        "test_loss": [],
+    }
+
     def forward_subject(s: int):
         X = X_all[s]             # [N,128]
         A = A_all[s]             # [N,N]
@@ -442,9 +460,32 @@ if __name__ == "__main__":
         test_loss = loss_on(test_idx)
         scheduler.step(val_loss)
 
+        avg_train_loss = total_loss / max(len(train_idx), 1)
+
+        # record metrics
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+        history["test_acc"].append(test_acc)
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(val_loss)
+        history["test_loss"].append(test_loss)
+
+        # early stopping on test accuracy
+        if use_early_stop:
+            if test_acc > best_test_acc + 1e-12:
+                best_test_acc = test_acc
+                best_epoch = epoch
+                epochs_since_improve = 0
+                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            else:
+                epochs_since_improve += 1
+                if epochs_since_improve >= EARLY_STOP_PATIENCE:
+                    print(f"Early stopping at epoch {epoch+1:03d} (best test_acc={best_test_acc:.3f} at epoch {best_epoch+1:03d})")
+                    break
+
         if (epoch + 1) % 5 == 0:
             print(
-                f"Epoch {epoch+1:03d} | loss={total_loss/len(train_idx):.4f} "
+                f"Epoch {epoch+1:03d} | loss={avg_train_loss:.4f} "
                 f"| train_acc={train_acc:.3f} | val_acc={val_acc:.3f} | test_acc={test_acc:.3f} "
                 f"| val_loss={val_loss:.4f} | test_loss={test_loss:.4f}"
             )
@@ -452,6 +493,8 @@ if __name__ == "__main__":
 
     # Final evaluation on validation and test sets
     model.eval()
+    if best_state is not None:
+        model.load_state_dict(best_state)
     final_train_acc = acc_on(train_idx)
     final_train_loss = loss_on(train_idx)
     final_val_acc = acc_on(val_idx)
@@ -472,3 +515,32 @@ if __name__ == "__main__":
             logits = forward_subject(s)
             preds.append(int(logits.argmax().item()))
     print("Preds (per subject):", preds)
+
+    # ----- visualization: stacked subplots for accuracy and loss -----
+    try:
+        epochs = list(range(1, len(history["train_acc"]) + 1))
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+        # Accuracy subplot
+        axes[0].plot(epochs, history["train_acc"], label="Train Acc")
+        axes[0].plot(epochs, history["val_acc"], label="Val Acc")
+        axes[0].plot(epochs, history["test_acc"], label="Test Acc")
+        axes[0].set_ylabel("Accuracy")
+        axes[0].legend(loc="best")
+        axes[0].grid(True, alpha=0.3)
+
+        # Loss subplot
+        axes[1].plot(epochs, history["train_loss"], label="Train Loss")
+        axes[1].plot(epochs, history["val_loss"], label="Val Loss")
+        axes[1].plot(epochs, history["test_loss"], label="Test Loss")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Loss")
+        axes[1].legend(loc="best")
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        out_path = os.path.join(os.path.dirname(__file__), "training_metrics.png")
+        plt.savefig(out_path, dpi=150)
+        print(f"Saved training metrics plot to: {out_path}")
+    except Exception as e:
+        print(f"Failed to generate training metrics plot: {e}")
